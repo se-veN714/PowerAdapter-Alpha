@@ -19,15 +19,21 @@ venv/
 
 # 数据文件（不入库）
 data/raw/*.csv
+data/raw/*.json
+data/raw/*.txt
 data/processed/*.csv
 
 # 模型检查点（不入库）
 checkpoints/*.pt
 checkpoints/*.pth
 
-# 日志
-logs/*.png
-logs/*.json
+# 日志（不入库）
+logs/
+
+# 内部开发文档（不入库）
+GUIDE.md
+TUNING.md
+PIPELINE.md
 
 # OS
 .DS_Store
@@ -35,3 +41,6 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# CodeBuddy
+.codebuddy/

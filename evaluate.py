@@ -20,6 +20,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from config import (
     CHECKPOINT_DIR, DEVICE, FACTOR_COLS, N_HIDDEN,
@@ -55,9 +56,10 @@ def predict(
     all_dates: list = []
 
     with torch.no_grad():
-        for idx, (x_batch, y_batch) in enumerate(loader):
+        for idx, (x_batch, y_batch) in enumerate(tqdm(
+            loader, desc="Predicting", ncols=80, leave=False,
+        )):
             x_batch = x_batch.to(DEVICE)
-            # 去掉DataLoader添加的batch维度
             x_batch = x_batch.squeeze(0)
             y_batch = y_batch.squeeze(0)
 
@@ -68,10 +70,12 @@ def predict(
 
             all_preds.append(pred.cpu().numpy())
             all_actuals.append(y_batch.numpy())
-            all_dates.append(dataset.get_date(idx))
+            # Expand date per-section to per-sample
+            section_date = dataset.get_date(idx)
+            all_dates.extend([section_date] * len(y_batch))
 
     predictions = np.concatenate(all_preds)
-    actuals = np.concatenate(all_preds)  # Fix: should be actuals
+    actuals = np.concatenate(all_actuals)
     return predictions, actuals, all_dates
 
 
@@ -101,7 +105,9 @@ def evaluate_model(
     all_dates: list = []
 
     with torch.no_grad():
-        for idx, (x_batch, y_batch) in enumerate(loader):
+        for idx, (x_batch, y_batch) in enumerate(tqdm(
+            loader, desc=f"Eval {model_name}", ncols=80, leave=False,
+        )):
             x_batch = x_batch.squeeze(0).to(DEVICE)
             y_batch = y_batch.squeeze(0)
 
@@ -175,7 +181,7 @@ def plot_group_return(
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"分组收益图已保存至 {save_path}")
+        print(f"Group return chart saved to {save_path}")
     else:
         plt.show()
     plt.close()
@@ -203,7 +209,7 @@ def compare_models(
         n_factors = config["n_factors"]
 
         if not Path(ckpt_path).exists():
-            print(f"⚠ 模型文件不存在: {ckpt_path}，跳过")
+            print(f"[WARN] model not found: {ckpt_path}, skipping")
             continue
 
         # 加载模型
@@ -234,11 +240,11 @@ def compare_models(
         )
 
     if not results:
-        print("没有可评估的模型")
+        print("No models to evaluate")
         return pd.DataFrame()
 
     comparison_df = pd.DataFrame(results)
-    print("\n模型对比表:")
+    print("\nModel comparison:")
     print(comparison_df.to_string(index=False))
     return comparison_df
 
@@ -247,7 +253,7 @@ if __name__ == "__main__":
     # 加载预处理数据
     processed_path = PROCESSED_DATA_DIR / "processed_data.csv"
     if not processed_path.exists():
-        print("请先运行 preprocess.py 生成预处理数据")
+        print("Please run preprocess.py first")
     else:
         df = pd.read_csv(processed_path, parse_dates=["date"])
         _, _, test_ds = split_dataset(df)
@@ -284,3 +290,132 @@ if __name__ == "__main__":
         ]
 
         compare_models(model_configs, test_ds)
+
+
+def evaluate_rolling_results(
+    all_results: list[dict],
+    save_dir: Path | None = None,
+) -> pd.DataFrame:
+    """汇总滚动训练结果，生成对比表和可视化。
+
+    Args:
+        all_results: 各窗口的评估结果列表，来自rolling_train()。
+        save_dir: 保存目录，默认LOG_DIR。
+
+    Returns:
+        汇总DataFrame。
+    """
+    from config import LOG_DIR
+
+    if save_dir is None:
+        save_dir = LOG_DIR
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    results_df = pd.DataFrame(all_results)
+
+    # ---- 1. Per-window comparison table ----
+    print(f"\n{'='*70}")
+    print("Rolling Training - Full Comparison Table")
+    print("=" * 70)
+    pivot_cols = ["model", "window", "rank_ic_mean", "icir",
+                  "ic_win_rate", "long_short_return"]
+    print(results_df[pivot_cols].to_string(index=False))
+
+    # ---- 2. Average across windows per model ----
+    avg_df = (
+        results_df.groupby("model")
+        .agg({
+            "rank_ic_mean": "mean",
+            "icir": "mean",
+            "ic_win_rate": "mean",
+            "long_short_return": "mean",
+        })
+        .reset_index()
+        .sort_values("rank_ic_mean", ascending=False)
+    )
+    avg_df.columns = ["model", "avg_ic", "avg_icir", "avg_ic_win",
+                       "avg_ls_return"]
+
+    print(f"\n{'='*70}")
+    print("Average Across Windows (sorted by avg IC)")
+    print("=" * 70)
+    print(avg_df.to_string(index=False))
+
+    # Save to CSV
+    csv_path = save_dir / "rolling_comparison.csv"
+    results_df.to_csv(csv_path, index=False)
+    print(f"\nResults saved to {csv_path}")
+
+    # ---- 3. Visualization: grouped bar chart ----
+    models = avg_df["model"].tolist()
+    x = np.arange(len(models))
+    width = 0.35
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Avg Rank IC
+    bars = axes[0].bar(x, avg_df["avg_ic"], width, color="steelblue",
+                       edgecolor="black", linewidth=0.5)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(models, rotation=30, ha="right", fontsize=9)
+    axes[0].set_ylabel("Avg Rank IC")
+    axes[0].set_title("Average Rank IC (Rolling)")
+    axes[0].axhline(y=0.03, color="red", linestyle="--", alpha=0.5)
+    axes[0].grid(True, alpha=0.3, axis="y")
+    for bar, val in zip(bars, avg_df["avg_ic"]):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+
+    # Avg ICIR
+    bars = axes[1].bar(x, avg_df["avg_icir"], width, color="darkorange",
+                       edgecolor="black", linewidth=0.5)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(models, rotation=30, ha="right", fontsize=9)
+    axes[1].set_ylabel("Avg ICIR")
+    axes[1].set_title("Average ICIR (Rolling)")
+    axes[1].axhline(y=0.5, color="red", linestyle="--", alpha=0.5)
+    axes[1].grid(True, alpha=0.3, axis="y")
+    for bar, val in zip(bars, avg_df["avg_icir"]):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+
+    # Avg L-S Return
+    bars = axes[2].bar(x, avg_df["avg_ls_return"], width, color="green",
+                       edgecolor="black", linewidth=0.5)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(models, rotation=30, ha="right", fontsize=9)
+    axes[2].set_ylabel("Avg Long-Short Return")
+    axes[2].set_title("Average L-S Return (Rolling)")
+    axes[2].axhline(y=0, color="black", linewidth=0.5)
+    axes[2].grid(True, alpha=0.3, axis="y")
+    for bar, val in zip(bars, avg_df["avg_ls_return"]):
+        axes[2].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+
+    fig.suptitle("Rolling Training Comparison", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    chart_path = save_dir / "rolling_comparison.png"
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+    print(f"Chart saved to {chart_path}")
+    plt.close()
+
+    # ---- 4. Per-window IC line chart ----
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    for model_name in results_df["model"].unique():
+        model_data = results_df[results_df["model"] == model_name]
+        ax2.plot(model_data["window"], model_data["rank_ic_mean"],
+                 marker="o", label=model_name, linewidth=2)
+    ax2.set_xlabel("Window Index")
+    ax2.set_ylabel("Rank IC Mean")
+    ax2.set_title("Rolling Rank IC per Window")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(y=0.03, color="red", linestyle="--", alpha=0.5,
+                label="IC=0.03 threshold")
+    plt.tight_layout()
+    line_path = save_dir / "rolling_ic_trend.png"
+    plt.savefig(line_path, dpi=150, bbox_inches="tight")
+    print(f"IC trend chart saved to {line_path}")
+    plt.close()
+
+    return avg_df

@@ -27,11 +27,13 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
+from tqdm import tqdm, trange
 
 from config import (
-    CHECKPOINT_DIR, DEVICE, FACTOR_COLS, LAMBDA_ORTH,
-    LEARNING_RATE, LOG_DIR, MAX_EPOCHS, N_HIDDEN, OPTIMIZER, PATIENCE,
-    PROCESSED_DATA_DIR, TRAIN_END, VAL_END,
+    ACTIVATION, CHECKPOINT_DIR, DEVICE, DROPOUT_RATE, FACTOR_COLS,
+    HIDDEN_DIMS, LAMBDA_ORTH, LEARNING_RATE, LOG_DIR, MAX_EPOCHS,
+    N_HIDDEN, OPTIMIZER, PATIENCE, PROCESSED_DATA_DIR, ROLLING_WINDOWS,
+    TRAIN_END, USE_LAYER_NORM, VAL_END, WEIGHT_DECAY,
 )
 from losses import ccc_loss, ic_loss, mse_loss, orthogonal_penalty
 from models.linear_alpha import LinearAlphaModel
@@ -66,8 +68,8 @@ def train_one_epoch(
     n_batches = 0
 
     for x_batch, y_batch in loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
+        x_batch = x_batch.squeeze(0).to(DEVICE)  # (1,N,P)→(N,P)
+        y_batch = y_batch.squeeze(0).to(DEVICE)  # (1,N)→(N,)
 
         optimizer.zero_grad()
 
@@ -113,8 +115,8 @@ def evaluate(
 
     with torch.no_grad():
         for x_batch, y_batch in loader:
-            x_batch = x_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
+            x_batch = x_batch.squeeze(0).to(DEVICE)  # (1,N,P)→(N,P)
+            y_batch = y_batch.squeeze(0).to(DEVICE)  # (1,N)→(N,)
 
             if is_mlp:
                 pred, hidden = model(x_batch)
@@ -145,6 +147,7 @@ def train(
     patience: int = PATIENCE,
     lr: float = LEARNING_RATE,
     lambda_orth: float = LAMBDA_ORTH,
+    weight_decay: float = WEIGHT_DECAY,
     save_name: str | None = None,
 ) -> dict[str, list[float]]:
     """完整训练流程，含早停和模型保存。
@@ -159,6 +162,7 @@ def train(
         patience: 早停耐心值。
         lr: 学习率。
         lambda_orth: 正交惩罚系数。
+        weight_decay: Adam权重衰减(L2正则)。
         save_name: 模型保存名称。
 
     Returns:
@@ -173,7 +177,14 @@ def train(
 
     # 优化器
     optimizer_map = {"Adam": torch.optim.Adam, "SGD": torch.optim.SGD}
-    optimizer = optimizer_map[OPTIMIZER](model.parameters(), lr=lr)
+    if OPTIMIZER == "Adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
 
     # DataLoader（batch_size=1因为每个截面就是一个完整batch）
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
@@ -186,13 +197,16 @@ def train(
         "val_ic": [],
     }
 
-    best_val_loss = float("inf")
+    best_val_ic = -float("inf")
     patience_counter = 0
 
-    print(f"训练开始 | 设备: {DEVICE} | 模型: {model.__class__.__name__} | 损失: {loss_name}")
+    print(f"Training | device: {DEVICE} | model: {model.__class__.__name__} | loss: {loss_name}")
+    print(f"Config  | lr={lr} | lambda_orth={lambda_orth} | wd={weight_decay}")
     print("-" * 70)
 
-    for epoch in range(1, max_epochs + 1):
+    pbar = trange(1, max_epochs + 1, desc="Epoch", ncols=100,
+                  unit="ep", leave=True)
+    for epoch in pbar:
         t0 = time.time()
 
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, lambda_orth, is_mlp)
@@ -204,21 +218,21 @@ def train(
 
         elapsed = time.time() - t0
 
-        # 每10个epoch打印一次
-        if epoch % 10 == 0 or epoch == 1:
-            print(
-                f"Epoch {epoch:4d}/{max_epochs} | "
-                f"train_loss={train_loss:.6f} | "
-                f"val_loss={val_loss:.6f} | "
-                f"val_ic={val_ic:.4f} | "
-                f"time={elapsed:.1f}s"
-            )
+        # Update tqdm postfix with live metrics
+        pbar.set_postfix(
+            t_loss=f"{train_loss:.4f}",
+            v_loss=f"{val_loss:.4f}",
+            v_ic=f"{val_ic:.4f}",
+            best_ic=f"{best_val_ic:.4f}",
+            pat=f"{patience_counter}/{patience}",
+            time=f"{elapsed:.1f}s",
+        )
 
-        # 早停检查
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Early stopping based on val_ic (higher is better)
+        if val_ic > best_val_ic:
+            best_val_ic = val_ic
             patience_counter = 0
-            # 保存最佳模型
+            # Save best model
             if save_name is None:
                 save_name = f"{model.__class__.__name__}_{loss_name}"
             CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -227,11 +241,12 @@ def train(
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n早停触发: 验证loss连续{patience}个epoch未下降")
+                pbar.close()
+                print(f"Early stop: val IC no improvement for {patience} epochs")
                 break
 
     print("-" * 70)
-    print(f"训练完成 | 最佳val_loss={best_val_loss:.6f}")
+    print(f"Training done | best val_ic={best_val_ic:.4f}")
 
     return history
 
@@ -275,7 +290,7 @@ def plot_training_history(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"训练曲线已保存至 {save_path}")
+        print(f"Training curve saved to {save_path}")
     else:
         plt.show()
     plt.close()
@@ -284,31 +299,48 @@ def plot_training_history(
 def run_training(
     model_type: str = "mlp",
     loss_name: str = "mse",
+    hidden_dims: tuple = HIDDEN_DIMS,
+    dropout: float = DROPOUT_RATE,
+    activation: str = ACTIVATION,
+    use_layer_norm: bool = USE_LAYER_NORM,
+    lr: float = LEARNING_RATE,
+    lambda_orth: float = LAMBDA_ORTH,
+    weight_decay: float = WEIGHT_DECAY,
 ) -> None:
     """运行单次训练的便捷入口。
 
     Args:
         model_type: 模型类型，"mlp"或"linear"。
         loss_name: 损失函数名称。
+        hidden_dims: MLP隐藏层维度序列。
+        dropout: Dropout比例。
+        activation: 激活函数名称。
+        use_layer_norm: True=LayerNorm。
+        lr: 学习率。
+        lambda_orth: 正交惩罚系数。
+        weight_decay: 权重衰减。
     """
     # 加载预处理数据
     processed_path = PROCESSED_DATA_DIR / "processed_data.csv"
     if not processed_path.exists():
-        print("请先运行 preprocess.py 生成预处理数据")
+        print("Please run preprocess.py first")
         return
 
     df = pd.read_csv(processed_path, parse_dates=["date"])
     train_ds, val_ds, test_ds = split_dataset(df)
 
-    # 获取因子数
+    # get factor count
     available_factors = [c for c in FACTOR_COLS if c in df.columns]
     n_factors = len(available_factors)
-    print(f"可用因子数: {n_factors}")
+    print(f"Available factors: {n_factors}")
 
     # 创建模型
     is_mlp = model_type == "mlp"
     if is_mlp:
-        model: nn.Module = MLPAlphaModel(n_factors)
+        model: nn.Module = MLPAlphaModel(
+            n_factors, hidden_dims=hidden_dims, dropout=dropout,
+            activation=activation, use_layer_norm=use_layer_norm,
+        )
     else:
         model = LinearAlphaModel(n_factors)
 
@@ -317,6 +349,9 @@ def run_training(
         model, train_ds, val_ds,
         loss_name=loss_name,
         is_mlp=is_mlp,
+        lr=lr,
+        lambda_orth=lambda_orth,
+        weight_decay=weight_decay,
         save_name=f"{model_type}_{loss_name}",
     )
 
@@ -334,100 +369,307 @@ def run_training(
 def rolling_train(
     model_type: str = "mlp",
     loss_name: str = "mse",
-    n_windows: int = 3,
-) -> None:
+    windows: list[tuple[str, str, str]] | None = None,
+    hidden_dims: tuple = HIDDEN_DIMS,
+    dropout: float = DROPOUT_RATE,
+    activation: str = ACTIVATION,
+    use_layer_norm: bool = USE_LAYER_NORM,
+    lr: float = LEARNING_RATE,
+    lambda_orth: float = LAMBDA_ORTH,
+    weight_decay: float = WEIGHT_DECAY,
+    patience: int = PATIENCE,
+) -> list[dict]:
     """滚动训练（扩展窗口）。
 
-    训练集用所有历史数据，验证集取最后252个交易日，
-    测试集为后续半年。每轮滚动向前推进一步。
+    训练集用所有历史数据（不断扩大），验证集和测试集各约半年。
+    每轮滚动向前推进一步，训练集不断增大（扩展窗口）。
 
     Args:
-        model_type: 模型类型。
-        loss_name: 损失函数名称。
-        n_windows: 滚动窗口数量。
+        model_type: 模型类型，"mlp"或"linear"。
+        loss_name: 损失函数名称，"mse"/"ic"/"ccc"。
+        windows: 滚动窗口列表，每项为(train_end, val_end, test_end)。
+        hidden_dims: MLP隐藏层维度序列。
+        dropout: Dropout比例。
+        activation: 激活函数名称。
+        use_layer_norm: True=LayerNorm。
+        lr: 学习率。
+        lambda_orth: 正交惩罚系数。
+        weight_decay: 权重衰减(L2正则)。
+        patience: 早停耐心值。
+
+    Returns:
+        每个窗口的评估结果列表。
     """
+    if windows is None:
+        windows = list(ROLLING_WINDOWS)
+
     processed_path = PROCESSED_DATA_DIR / "processed_data.csv"
     if not processed_path.exists():
-        print("请先运行 preprocess.py 生成预处理数据")
-        return
+        print("Please run preprocess.py first")
+        return []
 
     df = pd.read_csv(processed_path, parse_dates=["date"])
-    all_dates = sorted(df["date"].unique())
-
-    # 至少需要252+126个交易日
-    min_dates = 252 + 126
-    if len(all_dates) < min_dates:
-        print(f"数据不足: 需要至少{min_dates}个交易日，当前{len(all_dates)}个")
-        return
-
     available_factors = [c for c in FACTOR_COLS if c in df.columns]
     n_factors = len(available_factors)
     is_mlp = model_type == "mlp"
 
-    results: list[dict[str, float]] = []
+    # Print tuning config once
+    if is_mlp:
+        print(f"\nMLP Config: hidden_dims={hidden_dims} dropout={dropout} "
+              f"act={activation} ln={use_layer_norm}")
+    print(f"Train Config: lr={lr} lambda_orth={lambda_orth} "
+          f"wd={weight_decay} patience={patience}")
 
-    for w in range(n_windows):
-        # 滚动窗口划分
-        val_start_idx = len(all_dates) - (n_windows - w) * 126
-        val_start = all_dates[max(val_start_idx, 252)]
-        test_start_idx = val_start_idx + 126
-        test_start = all_dates[min(test_start_idx, len(all_dates) - 1)]
+    results: list[dict] = []
 
-        train_df = df[df["date"] < val_start].copy()
-        val_df = df[(df["date"] >= val_start) & (df["date"] < test_start)].copy()
-        test_df = df[df["date"] >= test_start].copy()
+    for w, (train_end, val_end, test_end) in enumerate(tqdm(
+        windows, desc=f"Rolling {model_type.upper()}+{loss_name.upper()}",
+        ncols=100, leave=True,
+    )):
+        train_end_dt = pd.Timestamp(train_end)
+        val_end_dt = pd.Timestamp(val_end)
+        test_end_dt = pd.Timestamp(test_end)
+
+        train_df = df[df["date"] < train_end_dt].copy()
+        val_df = df[(df["date"] >= train_end_dt) & (df["date"] < val_end_dt)].copy()
+        test_df = df[(df["date"] >= val_end_dt) & (df["date"] < test_end_dt)].copy()
 
         if len(train_df) < 100 or len(val_df) < 20:
-            print(f"窗口{w}: 数据不足，跳过")
+            print(f"Window {w}: not enough data, skipped")
             continue
 
-        print(f"\n{'='*50}")
-        print(f"滚动窗口 {w+1}/{n_windows}")
-        print(f"训练: ~{train_df['date'].min().date()} → {train_df['date'].max().date()} ({len(train_df)}行)")
-        print(f"验证: {val_df['date'].min().date()} → {val_df['date'].max().date()} ({len(val_df)}行)")
-        print(f"测试: {test_df['date'].min().date()} → {test_df['date'].max().date()} ({len(test_df)}行)")
+        print(f"\n{'='*60}")
+        print(f"Rolling window {w+1}/{len(windows)} | "
+              f"{model_type.upper()} + {loss_name.upper()}")
+        print(f"Train: {train_df['date'].min().date()} -> "
+              f"{train_df['date'].max().date()} ({len(train_df)} rows, "
+              f"{train_df['date'].nunique()} dates)")
+        print(f"Val:   {val_df['date'].min().date()} -> "
+              f"{val_df['date'].max().date()} ({len(val_df)} rows, "
+              f"{val_df['date'].nunique()} dates)")
+        print(f"Test:  {test_df['date'].min().date()} -> "
+              f"{test_df['date'].max().date()} ({len(test_df)} rows, "
+              f"{test_df['date'].nunique()} dates)")
 
         train_ds = FactorDataset(train_df, available_factors)
         val_ds = FactorDataset(val_df, available_factors)
         test_ds = FactorDataset(test_df, available_factors)
 
-        # 创建新模型
+        # Create new model for each window
         if is_mlp:
-            model: nn.Module = MLPAlphaModel(n_factors)
+            model: nn.Module = MLPAlphaModel(
+                n_factors, hidden_dims=hidden_dims, dropout=dropout,
+                activation=activation, use_layer_norm=use_layer_norm,
+            )
         else:
             model = LinearAlphaModel(n_factors)
 
+        save_name = f"{model_type}_{loss_name}_rolling{w}"
         history = train(
             model, train_ds, val_ds,
             loss_name=loss_name,
             is_mlp=is_mlp,
-            save_name=f"{model_type}_{loss_name}_rolling{w}",
+            lr=lr,
+            lambda_orth=lambda_orth,
+            weight_decay=weight_decay,
+            patience=patience,
+            save_name=save_name,
         )
 
-        # 加载最佳模型评估测试集
-        ckpt_path = CHECKPOINT_DIR / f"{model_type}_{loss_name}_rolling{w}_best.pt"
+        # Load best checkpoint and evaluate on test set
+        ckpt_path = CHECKPOINT_DIR / f"{save_name}_best.pt"
         if ckpt_path.exists():
-            model.load_state_dict(torch.load(ckpt_path, weights_only=True))
+            model.load_state_dict(
+                torch.load(ckpt_path, weights_only=True, map_location=DEVICE)
+            )
+        model = model.to(DEVICE)
 
-        loss_fn_map = {"mse": mse_loss, "ic": ic_loss, "ccc": ccc_loss}
+        # Full evaluation on test set
         test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
-        test_loss, test_ic = evaluate(model, test_loader, loss_fn_map[loss_name], is_mlp=is_mlp)
+        loss_fn_map = {"mse": mse_loss, "ic": ic_loss, "ccc": ccc_loss}
+        test_loss, test_ic = evaluate(
+            model, test_loader, loss_fn_map[loss_name], is_mlp=is_mlp
+        )
 
-        results.append({"window": w, "test_loss": test_loss, "test_ic": test_ic})
-        print(f"测试集: loss={test_loss:.6f}, RankIC={test_ic:.4f}")
+        # Compute detailed IC metrics
+        from utils.metrics import calc_ic_series, ic_summary, group_return
+        from evaluate import predict
 
-    # 汇总
+        predictions, actuals, pred_dates = predict(model, test_ds, is_mlp=is_mlp)
+        pred_series = pd.Series(predictions, name="prediction")
+        actual_series = pd.Series(actuals, name="actual")
+        date_series = pd.Series(pred_dates, name="date")
+
+        ic_series = calc_ic_series(pred_series, actual_series, date_series)
+        summary = ic_summary(ic_series)
+
+        # Group return for long-short
+        group_df = pd.DataFrame({
+            "date": date_series,
+            "prediction": pred_series,
+            "label": actual_series,
+        })
+        groups = group_return(group_df, n_groups=10)
+        ls_row = groups[groups["group"] == "long_short"]
+        ls_return = float(ls_row["mean_return"].values[0]) if len(ls_row) > 0 else 0.0
+
+        result = {
+            "window": w,
+            "model": f"{model_type}_{loss_name}",
+            "train_end": train_end,
+            "val_end": val_end,
+            "test_end": test_end,
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+            "rank_ic_mean": summary["rank_ic_mean"],
+            "icir": summary["icir"],
+            "ic_win_rate": summary["ic_win_rate"],
+            "long_short_return": ls_return,
+            "best_val_ic": max(history["val_ic"]),
+        }
+        results.append(result)
+
+        print(f"\nTest Results | {model_type.upper()} + {loss_name.upper()}")
+        print(f"  Rank IC: {summary['rank_ic_mean']:.4f}")
+        print(f"  ICIR:    {summary['icir']:.4f}")
+        print(f"  IC Win:  {summary['ic_win_rate']:.2%}")
+        print(f"  L-S Ret: {ls_return:.4f}")
+
+    # Summary
     if results:
-        print(f"\n{'='*50}")
-        print("滚动训练汇总:")
+        print(f"\n{'='*60}")
+        print(f"Rolling Summary | {model_type.upper()} + {loss_name.upper()}")
+        print("-" * 60)
+        print(f"{'Window':<8}{'IC Mean':>10}{'ICIR':>10}{'IC Win':>10}{'L-S Ret':>10}")
+        print("-" * 60)
         for r in results:
-            print(f"  窗口{r['window']}: loss={r['test_loss']:.6f}, RankIC={r['test_ic']:.4f}")
-        avg_ic = np.mean([r["test_ic"] for r in results])
-        print(f"  平均RankIC: {avg_ic:.4f}")
+            print(f"  W{r['window']:<6}{r['rank_ic_mean']:>10.4f}{r['icir']:>10.4f}"
+                  f"{r['ic_win_rate']:>10.2%}{r['long_short_return']:>10.4f}")
+        avg_ic = np.mean([r["rank_ic_mean"] for r in results])
+        avg_icir = np.mean([r["icir"] for r in results])
+        avg_win = np.mean([r["ic_win_rate"] for r in results])
+        avg_ls = np.mean([r["long_short_return"] for r in results])
+        print("-" * 60)
+        print(f"  {'Avg':<8}{avg_ic:>10.4f}{avg_icir:>10.4f}"
+              f"{avg_win:>10.2%}{avg_ls:>10.4f}")
+
+    return results
+
+
+def run_all_rolling(
+    hidden_dims: tuple = HIDDEN_DIMS,
+    dropout: float = DROPOUT_RATE,
+    activation: str = ACTIVATION,
+    use_layer_norm: bool = USE_LAYER_NORM,
+    lr: float = LEARNING_RATE,
+    lambda_orth: float = LAMBDA_ORTH,
+    weight_decay: float = WEIGHT_DECAY,
+    patience: int = PATIENCE,
+) -> None:
+    """运行所有模型+损失函数组合的滚动训练，并生成对比表。
+
+    Args:
+        hidden_dims: MLP隐藏层维度序列。
+        dropout: Dropout比例。
+        activation: 激活函数名称。
+        use_layer_norm: True=LayerNorm。
+        lr: 学习率。
+        lambda_orth: 正交惩罚系数。
+        weight_decay: 权重衰减。
+        patience: 早停耐心值。
+    """
+    from evaluate import evaluate_rolling_results
+
+    all_results: list[dict] = []
+    model_configs = [
+        ("linear", "mse"),
+        ("mlp", "mse"),
+        ("mlp", "ic"),
+        ("mlp", "ccc"),
+    ]
+
+    for model_type, loss_name in tqdm(
+        model_configs, desc="All Rolling", ncols=100, leave=True,
+    ):
+        print(f"\n{'#'*60}")
+        print(f"# Rolling Training: {model_type.upper()} + {loss_name.upper()}")
+        print(f"{'#'*60}")
+        results = rolling_train(
+            model_type=model_type, loss_name=loss_name,
+            hidden_dims=hidden_dims, dropout=dropout,
+            activation=activation, use_layer_norm=use_layer_norm,
+            lr=lr, lambda_orth=lambda_orth, weight_decay=weight_decay,
+            patience=patience,
+        )
+        all_results.extend(results)
+
+    # Save and visualize results
+    if all_results:
+        evaluate_rolling_results(all_results)
 
 
 if __name__ == "__main__":
-    # 单次训练
-    run_training(model_type="mlp", loss_name="mse")
-    # 滚动训练（取消注释启用）
-    # rolling_train(model_type="mlp", loss_name="mse", n_windows=3)
+    import argparse
+    import ast
+
+    parser = argparse.ArgumentParser(description="Project-Alpha Training")
+    parser.add_argument("--mode", choices=["single", "rolling", "tuning"],
+                        default="rolling", help="Training mode")
+    parser.add_argument("--model", default="mlp", help="Model type: mlp/linear")
+    parser.add_argument("--loss", default="ic", help="Loss function: mse/ic/ccc")
+    # Tuning params
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE,
+                        help="Learning rate")
+    parser.add_argument("--dropout", type=float, default=DROPOUT_RATE,
+                        help="Dropout rate")
+    parser.add_argument("--wd", type=float, default=WEIGHT_DECAY,
+                        help="Weight decay (L2 reg)")
+    parser.add_argument("--lambda_orth", type=float, default=LAMBDA_ORTH,
+                        help="Orthogonal penalty coefficient")
+    parser.add_argument("--hidden_dims", type=str, default=str(HIDDEN_DIMS),
+                        help="Hidden dims tuple, e.g. '(64,64)' or '(32,)'")
+    parser.add_argument("--activation", default=ACTIVATION,
+                        choices=["sigmoid", "gelu", "leaky_relu"],
+                        help="Activation function")
+    parser.add_argument("--layer_norm", action="store_true",
+                        default=USE_LAYER_NORM, help="Use LayerNorm")
+    parser.add_argument("--patience", type=int, default=PATIENCE,
+                        help="Early stopping patience")
+    args = parser.parse_args()
+
+    hidden_dims_tuple = ast.literal_eval(args.hidden_dims)
+
+    if args.mode == "tuning":
+        # Quick test: MLP+IC only, logging key params
+        print("=" * 60)
+        print("TUNING MODE: MLP+IC (single model, 6 windows)")
+        print(f"hidden_dims={hidden_dims_tuple} dropout={args.dropout} "
+              f"act={args.activation} ln={args.layer_norm}")
+        print(f"lr={args.lr} lambda_orth={args.lambda_orth} "
+              f"wd={args.wd} patience={args.patience}")
+        print("=" * 60)
+        from evaluate import evaluate_rolling_results
+        results = rolling_train(
+            model_type="mlp", loss_name="ic",
+            hidden_dims=hidden_dims_tuple, dropout=args.dropout,
+            activation=args.activation, use_layer_norm=args.layer_norm,
+            lr=args.lr, lambda_orth=args.lambda_orth,
+            weight_decay=args.wd, patience=args.patience,
+        )
+        if results:
+            evaluate_rolling_results(results)
+    elif args.mode == "rolling":
+        run_all_rolling(
+            hidden_dims=hidden_dims_tuple, dropout=args.dropout,
+            activation=args.activation, use_layer_norm=args.layer_norm,
+            lr=args.lr, lambda_orth=args.lambda_orth,
+            weight_decay=args.wd, patience=args.patience,
+        )
+    elif args.mode == "single":
+        run_training(
+            model_type=args.model, loss_name=args.loss,
+            hidden_dims=hidden_dims_tuple, dropout=args.dropout,
+            activation=args.activation, use_layer_norm=args.layer_norm,
+            lr=args.lr, lambda_orth=args.lambda_orth,
+            weight_decay=args.wd,
+        )

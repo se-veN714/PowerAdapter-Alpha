@@ -126,9 +126,9 @@ def split_dataset(
     val_df = df[(df["date"] >= train_end_dt) & (df["date"] < val_end_dt)].copy()
     test_df = df[df["date"] >= val_end_dt].copy()
 
-    print(f"训练集: {len(train_df)} 行, {train_df['date'].nunique()} 个交易日")
-    print(f"验证集: {len(val_df)} 行, {val_df['date'].nunique()} 个交易日")
-    print(f"测试集: {len(test_df)} 行, {test_df['date'].nunique()} 个交易日")
+    print(f"Train: {len(train_df)} rows, {train_df['date'].nunique()} dates")
+    print(f"Val:   {len(val_df)} rows, {val_df['date'].nunique()} dates")
+    print(f"Test:  {len(test_df)} rows, {test_df['date'].nunique()} dates")
 
     return (
         FactorDataset(train_df, factor_cols),
@@ -140,11 +140,11 @@ def split_dataset(
 if __name__ == "__main__":
     processed_path = PROCESSED_DATA_DIR / "processed_data.csv"
     if not processed_path.exists():
-        print("请先运行 preprocess.py 生成预处理数据")
+        print("Please run preprocess.py first")
     else:
         df = pd.read_csv(processed_path, parse_dates=["date"])
         train_ds, val_ds, test_ds = split_dataset(df)
         # 验证单个截面
         x, y = train_ds[0]
-        print(f"截面0: factors shape={x.shape}, labels shape={y.shape}")
-        print(f"截面0日期: {train_ds.get_date(0)}")
+        print(f"Section 0: factors shape={x.shape}, labels shape={y.shape}")
+        print(f"Section 0 date: {train_ds.get_date(0)}")

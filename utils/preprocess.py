@@ -122,42 +122,42 @@ def preprocess_pipeline(
         factor_cols = FACTOR_COLS
 
     df = df.copy()
-    print(f"预处理前: {len(df)} 行，{df['stock_code'].nunique()} 只股票")
+    print(f"Before preprocess: {len(df)} rows, {df['stock_code'].nunique()} stocks")
 
     # Step 1: 因子方向调整
     df = apply_factor_direction(df, factor_cols)
-    print("[1/5] 因子方向调整完成")
+    print("[1/5] Factor direction adjustment done")
 
     # Step 2: 逐因子 MAD去极值 + zscore标准化
     for col in factor_cols:
         if col not in df.columns:
-            print(f"  ⚠ 因子列 '{col}' 不存在，跳过")
+            print(f"  [WARN] factor '{col}' not found, skipped")
             continue
         # 跳过全NaN列
         if df[col].notna().sum() == 0:
-            print(f"  ⚠ 因子列 '{col}' 全为NaN，跳过")
+            print(f"  [WARN] factor '{col}' all NaN, skipped")
             continue
         df[col] = mad_clip_section(df, col)
         df[col] = zscore_section(df, col)
-    print("[2/5] MAD去极值 + zscore标准化完成")
+    print("[2/5] MAD clip + zscore standardization done")
 
     # Step 3: 缺失值填充为0
     for col in factor_cols:
         if col in df.columns:
             df[col] = df[col].fillna(0)
-    print("[3/5] 缺失值填充完成")
+    print("[3/5] NaN fill done")
 
     # Step 4: 构建收益率标签
     df["label"] = build_return_label(df)
-    print("[4/5] 收益率标签构建完成")
+    print("[4/5] Return label construction done")
 
     # Step 5: 删除标签为NaN的行（未来period天的数据不可用）
     n_before = len(df)
     df = df.dropna(subset=["label"])
     df["label"] = df["label"].fillna(0)
-    print(f"[5/5] 清理完成，删除 {n_before - len(df)} 行（标签缺失）")
+    print(f"[5/5] Cleanup done, removed {n_before - len(df)} rows (label missing)")
 
-    print(f"预处理后: {len(df)} 行")
+    print(f"After preprocess: {len(df)} rows")
     return df
 
 
@@ -170,7 +170,7 @@ if __name__ == "__main__":
     # 检查是否已有原始数据
     raw_path = RAW_DATA_DIR / "stock_data_with_factors.csv"
     if raw_path.exists():
-        print(f"加载已有数据: {raw_path}")
+        print(f"Loading existing data: {raw_path}")
         raw_df = pd.read_csv(raw_path, parse_dates=["date"])
     else:
         raw_df = fetch_stock_data()
@@ -178,4 +178,4 @@ if __name__ == "__main__":
 
     processed_df = preprocess_pipeline(raw_df)
     processed_df.to_csv(PROCESSED_DATA_DIR / "processed_data.csv", index=False, encoding="utf-8-sig")
-    print(f"预处理数据已保存")
+    print("Preprocessed data saved")

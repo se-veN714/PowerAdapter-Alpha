@@ -113,7 +113,7 @@ def _load_progress() -> set[str]:
                 print(f"[续传] 发现进度文件，已完成 {len(completed)} 只股票")
             return completed
         except (json.JSONDecodeError, KeyError):
-            print("[续传] 进度文件损坏，将从头开始")
+            print("[Resume] Progress file corrupted, starting fresh")
     return set()
 
 
@@ -159,9 +159,9 @@ def _check_network_proxy() -> None:
         sys_proxies = urllib.request.getproxies()
         if sys_proxies:
             proxy_addr = sys_proxies.get("https") or sys_proxies.get("http", "")
-            print(f"[代理] 检测到系统代理: {sys_proxies}")
-            print(f"[代理] 当前数据源 BaoStock 使用 TCP 连接，不受 HTTP 代理影响")
-            print(f"[代理] 若需使用 AKShare，请确保代理可用或关闭 VPN/梯子")
+            print(f"[Proxy] System proxy detected: {sys_proxies}")
+            print(f"[Proxy] BaoStock uses TCP, not affected by HTTP proxy")
+            print(f"[Proxy] For AKShare, ensure proxy works or disable VPN")
     except Exception:
         pass
 
@@ -433,7 +433,7 @@ def fetch_stock_data(
             print(f"[续传] 读取已有CSV失败: {e}，将从头获取")
 
     # 先测试单只股票以验证 BaoStock 可用
-    print("[BaoStock] 连接测试...", end=" ", flush=True)
+    print("[BaoStock] Connection test...", end=" ", flush=True)
     lg = bs.login()
     if lg.error_code != "0":
         msg = f"BaoStock 登录失败: [{lg.error_code}] {lg.error_msg}"
@@ -517,7 +517,7 @@ def fetch_stock_data(
     # 清理进度文件
     if PROGRESS_FILE.exists():
         PROGRESS_FILE.unlink()
-        print("[续传] 进度文件已清理")
+        print("[Resume] Progress file cleaned")
 
     if failed_codes:
         print(f"[!] 最终失败 {len(failed_codes)} 只: {failed_codes}")
@@ -611,27 +611,30 @@ def fetch_finance_data(
         raise RuntimeError(msg)
 
     all_frames: list[pd.DataFrame] = []
+    total = len(stock_pool)
     try:
         for i, code in enumerate(stock_pool, 1):
-            print(f"[{i}/{len(stock_pool)}] 获取 {code} 财务数据...", end=" ", flush=True)
+            pct = i / total
+            bar_w = 30
+            filled = int(bar_w * pct)
+            bar_str = "=" * filled + "-" * (bar_w - filled)
+            print(f"\rFinance [{bar_str}] {pct:5.1%} ({i}/{total}) {code}...", end="", flush=True)
             df = fetch_single_stock_finance(code, date_range[0], date_range[1])
             if not df.empty:
                 all_frames.append(df)
-                print(f"成功 ({len(df)} 条)")
-            else:
-                print("无数据")
             time.sleep(0.1)
+        print(f"\rFinance [{'=' * 30}] 100.0% ({total}/{total}) DONE!              ", flush=True)
     finally:
         bs.logout()
 
     if not all_frames:
-        print("[!] 未获取到任何财务数据")
+        print("[!] No finance data fetched")
         return pd.DataFrame()
 
     result = pd.concat(all_frames, ignore_index=True)
     csv_path = save_dir / "finance_data.csv"
     result.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"\n财务数据已保存至 {csv_path}，共 {len(result)} 行")
+    print(f"Finance saved to {csv_path}, {len(result)} rows")
     return result
 
 
@@ -743,7 +746,7 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     print("=" * 60)
-    print("Project-Alpha 数据获取（BaoStock）")
+    print("Project-Alpha Data Fetch (BaoStock)")
     print("=" * 60)
 
     # 第一步：获取行情+估值数据
@@ -751,13 +754,13 @@ if __name__ == "__main__":
 
     # 第二步：获取财务数据
     print("\n" + "=" * 60)
-    print("获取季度财务数据...")
+    print("Fetching quarterly finance data...")
     print("=" * 60)
     finance = fetch_finance_data()
 
     # 第三步：合并
     if not finance.empty:
-        print("\n合并财务数据到行情数据...")
+        print("\nMerging finance data into kline data...")
         data = merge_finance_to_kline(data, finance)
 
     # 保存最终结果

@@ -149,7 +149,7 @@ if __name__ == "__main__":
 
     ic_series = calc_ic_series(test_df["prediction"], test_df["label"], test_df["date"])
     summary = ic_summary(ic_series)
-    print(f"IC汇总: {summary}")
+    print(f"IC summary: {summary}")
 
     groups = group_return(test_df)
-    print(f"\n分组收益:\n{groups}")
+    print(f"\nGroup return:\n{groups}")

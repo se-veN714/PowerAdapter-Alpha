@@ -1,8 +1,46 @@
 # 端到端动态Alpha模型复现报告
 
 > **复现论文**：招商证券《端到端的动态Alpha模型》（2023）
+> **项目仓库**：[https://github.com/se-veN714/PowerAdapter-Alpha](https://github.com/se-veN714/PowerAdapter-Alpha)
 > **完成人**：seveN1foR
 > **日期**：2026-06-14
+
+---
+
+## 项目结构总览
+
+本报告按数据流顺序组织，每个章节对应项目中一个核心模块。阅读代码时建议按以下顺序：
+
+```
+config.py              ← 全局配置（所有参数的单一入口）
+    ↓
+utils/data_loader.py   ← 数据获取（BaoStock + AKShare）
+    ↓
+utils/preprocess.py    ← 预处理（MAD/zscore/标签）
+    ↓
+utils/dataset.py       ← PyTorch数据集（按截面加载）
+    ↓
+models/                ← 模型定义
+  ├── linear_alpha.py  ← 线性基准
+  └── mlp_alpha.py     ← MLP非线性模型
+    ↓
+losses.py              ← 三种损失 + 正交惩罚
+    ↓
+train.py               ← 训练（单次/滚动/调优）
+    ↓
+evaluate.py            ← 评估（RankIC/分组收益）
+    ↓
+utils/metrics.py       ← 评估指标函数
+```
+
+**辅助文件**：
+
+| 文件 | 用途 |
+|------|------|
+| `scripts/run_tuning.py` | 17组调优实验的批量运行脚本 |
+| `notebooks/reproduction.ipynb` | Jupyter Notebook 版完整复现流程 |
+| `logs/` | 训练历史JSON + 曲线图 + 调优结果 |
+| `checkpoints/` | 模型权重保存 |
 
 ---
 
@@ -25,104 +63,277 @@
 3. **正交惩罚**：强制隐藏层学到的隐因子彼此不相关，增加信息多样性
 4. **三种Loss对比**：MSE / IC / CCC，验证不同优化目标对选股效果的影响
 
-### 1.2 任务拆解
+### 1.2 任务拆解与代码映射
 
-| 阶段 | 内容 | 关键决策 |
-|------|------|----------|
-| 数据管线 | 股票池 → 日频K线 → 财务数据 → 因子计算 → 标签构造 | 数据源选择、时间范围、股票数量 |
-| 预处理 | 截面标准化、异常值处理、缺失值填充 | MAD倍数、标准化方式 |
-| 模型设计 | MLP架构、激活函数、正交机制 | 层数/维度、归一化层 |
-| 训练策略 | 滚动窗口、早停、优化器选择 | 窗口划分、patience |
-| 评估体系 | Rank IC、ICIR、分组收益 | 多指标交叉验证 |
+| 阶段 | 代码入口 | 关键函数/类 | 核心决策 |
+|------|---------|------------|----------|
+| 数据获取 | `utils/data_loader.py` | `fetch_stock_data()`, `compute_derived_factors()` | 数据源、股票池、时间范围 |
+| 预处理 | `utils/preprocess.py` | `preprocess_pipeline()` → 5步流水线 | MAD倍数、截面标准化方式 |
+| 数据集构建 | `utils/dataset.py` | `FactorDataset`, `split_dataset()` | 按截面加载、时间划分 |
+| 模型定义 | `models/linear_alpha.py`, `models/mlp_alpha.py` | `LinearAlphaModel`, `MLPAlphaModel` | 架构、激活函数、归一化层 |
+| 损失函数 | `losses.py` | `mse_loss()`, `ic_loss()`, `ccc_loss()`, `orthogonal_penalty()` | 损失类型、正交惩罚λ |
+| 训练 | `train.py` | `train()`, `rolling_train()`, `train_one_epoch()` | 早停、滚动窗口、优化器 |
+| 评估 | `evaluate.py`, `utils/metrics.py` | `predict()`, `rank_ic()`, `group_return()` | RankIC、ICIR、分组收益 |
 
 ---
 
 ## 二、复现方法论
 
-### 2.1 数据管线
+### 2.1 数据获取 → `utils/data_loader.py`
+
+> **代码入口**：`python -m utils.data_loader`
 
 #### 股票池（50只，覆盖13个行业）
+
+定义在 [`config.py` L31-97](https://github.com/se-veN714/PowerAdapter-Alpha/blob/main/config.py)，`STOCK_POOL` 常量。
 
 银行（6）、保险/券商（4）、食品饮料（5）、家电（1）、科技/制造/电子（6）、医药（5）、地产/建材（3）、钢铁/有色（3）、化工（3）、电力/公用（3）、建筑（2）、通信/传媒（2）、石油/煤炭（3）、新能源（2）、汽车（2）。
 
 选取标准：沪深300成分股中的代表性标的，覆盖主要行业，确保50只股票在i5-12450H + RTX 4060环境下可承载。
 
-#### 数据源
+#### 数据源与获取逻辑
 
-| 数据源 | 用途 | 说明 |
-|--------|------|------|
-| BaoStock | 主数据源，日频K线+财务数据 | 免费、稳定，但科创板不支持 |
-| AKShare | 备选数据源 | 作为BaoStock缺失数据的补充 |
+| 数据源 | 用途 | 对应函数 | 说明 |
+|--------|------|---------|------|
+| BaoStock | 主数据源 | `fetch_single_stock_kline()` L169, `fetch_single_stock_finance()` L274 | 免费、TCP长连接、断点续传 |
+| AKShare | 备选 | — | BaoStock缺失数据的补充 |
+
+**数据获取流程**（`data_loader.py` L376-525 `fetch_stock_data()`）：
+
+```
+BaoStock login → 逐只获取K线+估值 → 断点续传进度保存
+    → 获取季度财务数据 fetch_finance_data()
+    → 合并 merge_finance_to_kline()  ← pd.merge_asof 前向填充
+    → 计算衍生因子 compute_derived_factors()
+    → 保存 CSV
+```
+
+关键设计：
+- **断点续传**：`_save_progress()` / `_load_progress()` — 每成功获取一只股票更新进度文件，中断后可续跑
+- **指数退避重试**：`_exponential_backoff()` — 最多5次重试，上限60s
+- **批量暂停**：每10只股票暂停5秒，避免被限流
 
 #### 时间范围
 
-- **全量数据**：2018-01-01 至 2023-12-31（6年）
-- **标签周期**：T+1 至 T+20 收益率（约1个月）
-- **最终数据量**：72,556 行，50只股票
+定义在 [`config.py` L100](https://github.com/se-veN714/PowerAdapter-Alpha/blob/main/config.py)，`DATE_RANGE = ("2018-01-01", "2023-12-31")`。
+
+- **全量数据**：6年，72,556行
+- **标签周期**：`LABEL_PERIOD = 20`（T+1至T+20收益率）
 
 #### 因子体系（11因子）
 
-| 类别 | 因子 | 方向 | 说明 |
-|------|------|:--:|------|
-| 估值 | EP（盈利收益率） | + | 归母净利润/总市值 |
-| 估值 | BP（账面市值比） | + | 净资产/总市值 |
-| 成长 | ROE增长率 | + | ROE同比增长率 |
-| 成长 | 净利润增长率 | + | 归母净利润同比增长率 |
-| 成长 | 营收增长率 | + | 营业收入同比增长率 |
-| 经营 | ROE | + | 净资产收益率 |
-| 经营 | 总资产周转率 | + | 营运效率指标 |
-| 流动性 | 换手率 | - | 20日日均换手率 |
-| 流动性 | 振幅 | - | 20日日均振幅 |
-| 技术 | 20日动量 | + | 20日累计收益 |
-| 技术 | 5日反转 | - | 5日累计收益（反转效应） |
+定义在 [`config.py` L103-121](https://github.com/se-veN714/PowerAdapter-Alpha/blob/main/config.py)，`FACTOR_COLS` + `FACTOR_DIRECTION`。
 
-> ⚠️ 股息率（DP）因子因BaoStock不提供股息数据暂缺，标记为待补充。
+| 类别 | 因子 | 方向 | 计算来源 | 说明 |
+|------|------|:--:|---------|------|
+| 估值 | EP | + | `1/pe_ttm` | `compute_derived_factors()` L551 |
+| 估值 | BP | + | `1/pb_mrq` | `compute_derived_factors()` L555 |
+| 成长 | ROE增长率 | + | BaoStock财务API | `fetch_single_stock_finance()` L310 |
+| 成长 | 净利润增长率 | + | BaoStock财务API | `query_growth_data` |
+| 成长 | 营收增长率 | + | BaoStock财务API | `query_growth_data` |
+| 经营 | ROE | + | BaoStock财务API | `query_profit_data` |
+| 经营 | 总资产周转率 | + | BaoStock财务API | `query_operation_data` |
+| 流动性 | 换手率 | - | BaoStock K线字段 | `turn` → `turnover_rate` |
+| 流动性 | 振幅 | - | `(high-low)/close` 5日均值 | `compute_derived_factors()` L567 |
+| 技术 | 20日动量 | + | `pct_change(20)` | `compute_derived_factors()` L561 |
+| 技术 | 5日反转 | - | `pct_change(5)` | `compute_derived_factors()` L564 |
 
-### 2.2 数据预处理
+> ⚠️ 股息率（DP）因子因BaoStock不提供股息数据暂缺。`config.py` L107 已注释 `# "dp"`。
 
-```
-原始数据 → MAD异常值处理 → 截面z-score标准化 → 标签构造
-```
+### 2.2 数据预处理 → `utils/preprocess.py`
 
-- **异常值处理**：MAD（绝对中位差）法，倍数=3，按因子列逐月处理
-- **截面标准化**：每交易日截面内做z-score标准化，使每个因子均值≈0、标准差≈1
-- **标签构造**：T+1至T+20的累计收益率，再做截面z-score标准化
-- **验证结果**：11个因子列截面内均值≈0，标准差≈1，无NaN
+> **代码入口**：`python -m utils.preprocess`
+> **核心函数**：`preprocess_pipeline()` L108-161
 
-### 2.3 模型架构
+5步流水线，严格按截面操作（`groupby("date")`），**禁止全局操作**以避免未来信息泄露：
 
 ```
-输入层 (11因子)
-    ↓
-Linear(11, 64) → BatchNorm1d → Sigmoid/LeakyReLU
-    ↓
-Linear(64, 64) → BatchNorm1d → Sigmoid/LeakyReLU      ← 正交惩罚作用于此层输出
-    ↓
-Linear(64, 1) → 预测zscore
+原始数据 → [1] 因子方向调整 → [2] MAD去极值+zscore → [3] 缺失填0 → [4] 标签构建 → [5] 清理
 ```
 
-**设计要点**：
+#### Step 1: 因子方向调整 — `apply_factor_direction()` L88-105
+
+负方向因子（换手率、振幅、5日反转）乘-1，确保所有因子"越大越好"。方向定义在 `config.py` L124-137 `FACTOR_DIRECTION`。
+
+```python
+df[col] = df[col] * FACTOR_DIRECTION[col]  # -1 方向的因子取负
+```
+
+#### Step 2: MAD去极值 + 截面zscore — `mad_clip_section()` L21-42, `zscore_section()` L45-64
+
+**为什么用MAD不用3σ？** MAD基于中位数，对极端值鲁棒；3σ基于均值，会被极端值本身拉偏。
+
+```python
+# MAD去极值（截面内）
+median = group.median()
+mad = (group - median).abs().median()       # 绝对中位差
+group.clip(lower=median-3*mad, upper=median+3*mad)
+
+# zscore标准化（截面内）
+(group - group.mean()) / group.std()
+```
+
+关键：`df.groupby("date")[col].transform(...)` — **每个交易日截面独立处理**，不同天互不影响。
+
+#### Step 4: 标签构建 — `build_return_label()` L67-85
+
+```python
+# 按股票计算20日收益率，再shift(-20)对齐到买入日
+future_return = df.groupby("stock_code")["close"].pct_change(20).shift(-20)
+# 标签也做截面zscore
+label = zscore_section(temp_df, "_raw_return")
+```
+
+注意标签构建是**按股票分组**（`groupby("stock_code")`），和因子预处理按日期分组方向不同。
+
+### 2.3 数据集构建 → `utils/dataset.py`
+
+> **核心类**：`FactorDataset` L25-97
+
+**关键设计**：每个 `__getitem__` 返回**一个交易日截面**的所有股票，而非单只股票：
+
+```python
+def __getitem__(self, idx):
+    date_val = self.dates[idx]
+    section = self.data.loc[self._group_indices[date_val]]
+    return factor_tensor, label_tensor  # shape: (N, P), (N,)
+```
+
+这意味着一个"样本"= 一天内50只股票的所有因子。DataLoader的 `batch_size=1`，因为每个截面已经是一组完整的mini-batch。
+
+**时间划分** — `split_dataset()` L100-137，**严禁随机split**：
+
+```python
+train_df = df[df["date"] < train_end_dt]         # 用历史训练
+val_df = df[(df["date"] >= train_end_dt) & ...]   # 验证
+test_df = df[df["date"] >= val_end_dt]             # 测试
+```
+
+### 2.4 模型架构 → `models/`
+
+#### 线性基准 — `models/linear_alpha.py`
+
+> **代码**：`LinearAlphaModel` L26-63
+
+```python
+self.net = nn.Sequential(
+    Linear(11, 64) → BatchNorm1d(64),     # 学习64个"细分因子"
+    Linear(64, 6)  → BatchNorm1d(6),       # 学习6个"大类因子组合"
+    Linear(6, 1),                           # 输出预测zscore
+)
+```
+
+**无激活函数** — BatchNorm是仿射变换，不引入非线性。作为MLP的对照组。
+
+#### MLP模型 — `models/mlp_alpha.py`
+
+> **代码**：`MLPAlphaModel` L65-129
+
+```python
+# 默认配置 (hidden_dims=(64,64))
+Linear(11, 64) → BatchNorm1d → LeakyReLU(0.01)     # 第一隐藏层
+Linear(64, 64) → BatchNorm1d → LeakyReLU(0.01)     # 第二隐藏层 ← 正交惩罚作用于此层输出
+Linear(64, 1)                                        # 输出层（无激活函数）
+```
+
+**关键设计要点**（代码注释 L17-21）：
 
 1. **末层无激活函数**：标签是截面zscore（均值≈0，有正有负），加ReLU会强制预测≥0，导致无法拟合负标签
-2. **Sigmoid而非ReLU**：因子标准化后均值≈0，BN后将分布压在0附近，ReLU在x<0时梯度=0导致约50%神经元"死亡"
-3. **BatchNorm而非LayerNorm**：小batch（2048）场景下BN已足够，LayerNorm在实验中被验证为灾难（IC -4.07%）
-4. **正交惩罚**：对第二隐藏层输出的协方差矩阵非对角元素施加Frobenius范数惩罚，使学到的64维隐因子尽量不相关
+2. **LeakyReLU而非ReLU**：因子标准化后均值≈0，ReLU在x<0时梯度=0导致约50%神经元"死亡"
+3. **forward返回元组**：`(prediction, last_hidden_output)` — 隐藏层输出用于计算正交惩罚
 
-### 2.4 损失函数
+**可配置组件**（v2.5+）：
+- `_get_activation()` L33-47：激活函数工厂，支持 `sigmoid` / `gelu` / `leaky_relu`
+- `_get_norm()` L50-62：归一化层选择，`BatchNorm1d` / `LayerNorm`
+- `hidden_dims` 参数：支持 `(64,64)` / `(128,64,32)` 等可变架构
 
-三种损失函数对比实验：
+### 2.5 损失函数 → `losses.py`
 
-| Loss | 公式 | 优点 | 缺点 |
-|------|------|------|------|
-| **MSE** | (pred - target)² | 稳定收敛 | 不直接优化排序 |
-| **IC** | -Pearson(pred, target) | 直接优化Rank IC | 非凸，可能震荡 |
-| **CCC** | 结合MSE+IC | 论文推荐 | 小样本不稳定 |
+> **代码**：L1-148
 
-总损失 = loss_fn(pred, target) + λ_orth × orthogonal_penalty(hidden)
+三种损失函数 + 正交惩罚项。总损失组合：
 
-### 2.5 训练策略
+```
+total_loss = loss_fn(pred, target) + λ_orth × orthogonal_penalty(hidden)
+```
 
-**滚动窗口**（6窗口，扩展窗口法）：
+#### MSE — `mse_loss()` L20-32
+
+```python
+return F.mse_loss(pred, target)
+```
+
+基准损失，稳定收敛，但仅优化绝对偏差（点估计精度）。
+
+#### IC — `ic_loss()` L35-62
+
+```python
+pred_centered = pred - pred.mean()
+target_centered = target - target.mean()
+correlation = (pred_centered * target_centered).mean() / (pred_std * target_std + eps)
+return -correlation  # 取负，最大化相关系数=最小化负相关系数
+```
+
+直接优化Pearson相关系数（排序能力），非凸目标函数，收敛可能震荡。
+
+#### CCC — `ccc_loss()` L65-95
+
+```python
+# CCC = 2ρσ_predσ_target / (σ_pred² + σ_target² + (μ_pred - μ_target)²)
+```
+
+来自 Liao & Lewis (2000)，结合MSE和IC的优点。需同时估计均值、方差和相关系数——小样本下参数估计不可靠。
+
+#### 正交惩罚 — `orthogonal_penalty()` L98-121
+
+```python
+C = h.T @ h / N                    # 协方差矩阵 (d, d)
+diagonal = torch.diag(torch.diag(C))  # 提取对角线
+off_diagonal = C - diagonal        # 非对角元素 = 协方差
+return torch.norm(off_diagonal, p="fro")  # F范数
+```
+
+**只惩罚非对角元素（协方差），保留对角元素（方差）** — 因为方差是有用的信息量，不应被压制。
+
+### 2.6 训练策略 → `train.py`
+
+> **核心函数**：`train_one_epoch()` L72-95, `train()` L140-251, `rolling_train()` L369+
+
+#### 训练单epoch — `train_one_epoch()` L72-95
+
+```python
+for x_batch, y_batch in loader:
+    x_batch = x_batch.squeeze(0).to(DEVICE)  # (1,N,P)→(N,P) 关键修复！
+    y_batch = y_batch.squeeze(0).to(DEVICE)  # (1,N)→(N,)
+
+    if is_mlp:
+        pred, hidden = model(x_batch)
+        loss = loss_fn(pred, y_batch) + lambda_orth * orthogonal_penalty(hidden)
+    else:
+        pred = model(x_batch)
+        loss = loss_fn(pred, y_batch)
+```
+
+**DataLoader维度修复**（L80-81）：`FactorDataset.__getitem__` 返回 `(N, P)`，DataLoader添加batch维度变成 `(1, N, P)`，必须 `.squeeze(0)` 还原。
+
+#### 早停机制 — `train()` L231-246
+
+基于验证集RankIC（越高越好），`patience=50` 个epoch不提升则停止：
+
+```python
+if val_ic > best_val_ic:
+    best_val_ic = val_ic
+    patience_counter = 0
+    torch.save(model.state_dict(), save_path)  # 保存最优模型
+else:
+    patience_counter += 1
+    if patience_counter >= patience:
+        break  # 早停
+```
+
+#### 滚动训练（扩展窗口）— `rolling_train()` L369+
+
+定义在 [`config.py` L175-182](https://github.com/se-veN714/PowerAdapter-Alpha/blob/main/config.py)，`ROLLING_WINDOWS` 常量。
 
 | 窗口 | 训练期 | 验证期 | 测试期 |
 |:----:|--------|--------|--------|
@@ -133,24 +344,20 @@ Linear(64, 1) → 预测zscore
 | W4 | 2018-2022H1 | 2022H2 | 2023H1 |
 | W5 | 2018-2022 | 2023H1 | 2023H2 |
 
-**训练参数**：
+**扩展窗口**（非滑动窗口）：训练集不断扩大，永远只用历史数据。每个窗口独立训练、独立评估。
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| 优化器 | Adam | 自适应学习率 |
-| 最大Epochs | 1000 | 上限保护 |
-| 早停 | patience=50 | 验证集IC不再提升即停 |
-| Batch Size | 2048 | 截面内全量训练 |
-| 设备 | CUDA (RTX 4060 8GB) | GPU加速 |
+### 2.7 评估体系 → `evaluate.py` + `utils/metrics.py`
 
-### 2.6 评估体系
+> **核心函数**：`predict()` L45-79, `evaluate_model()` L82+, `rank_ic()` L19-34, `group_return()` L89-131
 
-| 指标 | 含义 | 评估维度 |
-|------|------|----------|
-| **Rank IC Mean** | 预测排名与真实排名的Spearman相关系数均值 | 选股能力 |
-| **ICIR** | Rank IC均值 / Rank IC标准差 | 稳定性 |
-| **IC Win Rate** | 各交易日IC>0的比例 | 胜率 |
-| **分组收益** | 按预测分10组，看各组平均收益单调性 | 可投资性 |
+| 指标 | 函数 | 含义 | 评估维度 |
+|------|------|------|----------|
+| **Rank IC** | `metrics.rank_ic()` | Spearman秩相关系数 | 选股能力 |
+| **ICIR** | `metrics.ic_summary()` | IC均值/IC标准差 | 稳定性 |
+| **IC Win Rate** | `metrics.ic_summary()` | IC>0的截面占比 | 胜率 |
+| **分组收益** | `metrics.group_return()` | 按 `pd.qcut` 分10组 | 可投资性 |
+
+**分组收益**中的 Long-Short 行：第10组均值 - 第1组均值，代表多空对冲收益。
 
 ---
 
@@ -216,23 +423,12 @@ Linear(64, 1) → 预测zscore
 
 ---
 
-## 五、关键挑战与解决方案
+## 五、超参数调优
 
-| 挑战 | 表现 | 解决方案 |
-|------|------|----------|
-| **小样本过拟合** | 50只股票 vs 论文~500只，Dropout/WD均无效 | 控制变量法确认非过拟合而是欠拟合 |
-| **BaoStock限制** | 科创板不支持，dp因子无数据 | AKShare备选，dp标记为待补充 |
-| **数据获取不稳定** | 频繁请求被限流 | 每3只股票logout重连 |
-| **ReLU导致梯度死亡** | 预测全为正，IC为负 | 改用Sigmoid，BN后0附近有非零梯度 |
-| **DataLoader维度问题** | batch维度叠加导致训练失败 | squeeze(0)修复 |
-| **2022年市场异常** | W2/W3全模型IC为负 | 设计跨窗口评估，不依赖单窗口结果 |
-| **v2.5架构重构** | Baseline从+2.78%降为+0.24% | MLP初始化路径改变，重新建立基准 |
+> **运行脚本**：`scripts/run_tuning.py`
+> **结果目录**：`logs/tuning/`
 
----
-
-## 附录A：超参数调优
-
-### A.1 调优方法论
+### 5.1 调优方法论
 
 采用**控制变量法**，5轮17实验：
 
@@ -240,7 +436,7 @@ Linear(64, 1) → 预测zscore
 固定种子 → 一次只改一个参数 → 6窗口滚动评估 → 对比Mean IC/Std IC/正窗口数
 ```
 
-### A.2 各轮实验
+### 5.2 各轮实验
 
 #### Round 1：正则化（5实验）— 验证过拟合假设
 
@@ -295,7 +491,7 @@ Linear(64, 1) → 预测zscore
 
 **结论**：LeakyReLU/GELU均优于Sigmoid。GELU虽均值略低，但5/6窗口为正（全榜最稳定）。LayerNorm对BN小batch场景灾难。
 
-### A.3 最终全排名（17实验 Top 6）
+### 5.3 最终全排名（17实验 Top 6）
 
 | Rank | 实验 | 关键配置 | Mean IC | 正窗口 |
 |:----:|------|------|:------:|:-----:|
@@ -306,21 +502,21 @@ Linear(64, 1) → 预测zscore
 | 5 | R4.2_orth1e3 | λ=0.001 | +0.71% | 2/6 |
 | 6 | R1_baseline | 原始配置 | +0.24% | 2/6 |
 
-### A.4 最终最优配置
+### 5.4 最终最优配置
 
 ```
 模型:     MLP + IC Loss
-架构:     [11 → 64 → 64 → 1]
-归一化:   BatchNorm1d
-激活:     LeakyReLU(0.01)
-学习率:   0.003 (Adam)
-正交λ:    0.1
+架构:     [11 → 64 → 64 → 1]       ← models/mlp_alpha.py
+归一化:   BatchNorm1d               ← _get_norm(use_layer_norm=False)
+激活:     LeakyReLU(0.01)           ← _get_activation("leaky_relu")
+学习率:   0.003 (Adam)              ← 比默认0.0005高6倍
+正交λ:    0.1                       ← 比论文默认0.01高10倍
 正则化:   无 Dropout, 无 Weight Decay
 早停:     patience=50 (验证集IC)
 Mean IC:  +1.81% (R4.3)
 ```
 
-### A.5 提升路径
+### 5.5 提升路径
 
 ```
 Baseline (+0.24%)
@@ -346,23 +542,37 @@ Baseline (+0.24%)
 
 ---
 
-## 七、结论与后续建议
+## 七、关键挑战与解决方案
 
-### 7.1 复现成果
+| 挑战 | 表现 | 解决方案 | 代码位置 |
+|------|------|----------|---------|
+| **截面思维** | 全局操作泄露未来信息 | 所有预处理 `groupby("date")` | `preprocess.py` L42, L64 |
+| **DataLoader维度** | batch维度叠加导致训练失败 | `.squeeze(0)` 修复 | `train.py` L80-81, `evaluate.py` L63-64 |
+| **ReLU死神经元** | 预测全为正，IC为负 | 改用LeakyReLU | `mlp_alpha.py` L44 |
+| **末层激活函数** | ReLU截断负预测 | 末层无激活函数 | `mlp_alpha.py` L112-113 |
+| **evaluate.py bug** | `actuals = np.concatenate(all_preds)` | 修复为 `all_actuals` | `evaluate.py` L77-78 |
+| **2022年市场异常** | W2/W3全模型IC为负 | 设计跨窗口评估 | `config.py` L175-182 |
+| **小样本欠拟合** | Dropout/WD均无效 | 控制变量法确认欠拟合 | `scripts/run_tuning.py` |
+
+---
+
+## 八、结论与后续建议
+
+### 8.1 复现成果
 
 1. ✅ 完整复现了论文的端到端Alpha模型，包括数据管线、MLP架构、三种Loss、正交惩罚
 2. ✅ 建立了6窗口滚动训练+评估体系，确保结果不依赖单一市场窗口
 3. ✅ 通过17组控制变量实验，找到了适配小样本场景的最优配置（+1.81% Mean IC）
 4. ✅ 发现并验证了反直觉结论：小样本下正则化有害、强正交有益
 
-### 7.2 待改进项
+### 8.2 待改进项
 
-| 优先级 | 项目 | 预期影响 |
-|:--:|------|----------|
-| 高 | 补充dp（股息率）因子 | 增加估值维度信息 |
-| 高 | 扩大股票池（50→200+） | 提升MLP非线性建模空间 |
-| 中 | 添加更多因子（波动率、流动性等） | 丰富因子多样性 |
-| 中 | 尝试Transformer/Attention架构 | 捕捉因子间交互 |
-| 低 | 集成多个最优配置 | 降低方差、提升稳定性 |
+| 优先级 | 项目 | 预期影响 | 代码改动 |
+|:--:|------|----------|---------|
+| 高 | 补充dp（股息率）因子 | 增加估值维度信息 | `data_loader.py` + `config.py` |
+| 高 | 扩大股票池（50→200+） | 提升MLP非线性建模空间 | `config.py` `STOCK_POOL` |
+| 中 | 添加更多因子（波动率、流动性等） | 丰富因子多样性 | `compute_derived_factors()` |
+| 中 | 尝试Transformer/Attention架构 | 捕捉因子间交互 | 新增 `models/transformer_alpha.py` |
+| 低 | 集成多个最优配置 | 降低方差、提升稳定性 | 新增 `ensemble.py` |
 
 ---

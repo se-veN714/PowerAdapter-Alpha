@@ -1,8 +1,10 @@
 # 端到端动态Alpha模型复现报告
 
 > **复现论文**：招商证券《端到端的动态Alpha模型》（2023）
+> 
 > **项目仓库**：[https://github.com/se-veN714/PowerAdapter-Alpha](https://github.com/se-veN714/PowerAdapter-Alpha)
-> **完成人**：seveN1foR
+> 
+> **完成人**：seveN1foR(董庆语)
 > **日期**：2026-06-14
 
 ---
@@ -390,6 +392,28 @@ else:
 
 **发现**：Linear > MLP。50只股票数据量不足以让非线性模型发挥优势，简单模型在小样本下更稳定。
 
+#### 训练曲线（Loss / IC 收敛）
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/linear_mse_curve.png" width="45%" alt="Linear+MSE"/>
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/mlp_ic_curve.png" width="45%" alt="MLP+IC"/>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/mlp_mse_curve.png" width="45%" alt="MLP+MSE"/>
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/mlp_ccc_curve.png" width="45%" alt="MLP+CCC"/>
+</p>
+
+#### 分组收益（10分位 Long-Short）
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/Linear_MSE_group_return.png" width="45%" alt="Linear+MSE 分组收益"/>
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/MLP_IC_group_return.png" width="45%" alt="MLP+IC 分组收益"/>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/MLP_MSE_group_return.png" width="45%" alt="MLP+MSE 分组收益"/>
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/MLP_CCC_group_return.png" width="45%" alt="MLP+CCC 分组收益"/>
+</p>
+
 ### 4.2 P2 滚动训练（v2.4 基准）
 
 6窗口等长测试集，每种模型独立训练6次：
@@ -404,6 +428,13 @@ else:
 | W5 | 2023H2 | +15.6% | +12.1% | +12.1% | +7.2% |
 
 **平均IC**：MLP+IC +2.78% > Linear+MSE +2.12% > MLP+MSE +0.93% > MLP+CCC -0.45%
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/rolling_comparison.png" width="65%" alt="4模型×6窗口 滚动对比"/>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/se-veN714/PowerAdapter-Alpha/main/logs/rolling_ic_trend.png" width="65%" alt="6窗口 IC 趋势"/>
+</p>
 
 **与论文的差异**：
 
